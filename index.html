@@ -1,1 +1,742 @@
-
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+ 
+// ─── Helpers ───────────────────────────────────────────────────────────────
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function formatTime(sec) {
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+ 
+// ─── Edge detection (Sobel) ────────────────────────────────────────────────
+function detectEdges(imageData, threshold = 30) {
+  const { data, width, height } = imageData;
+  const gray = new Float32Array(width * height);
+  for (let i = 0; i < width * height; i++) {
+    const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
+    gray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+  }
+  const edges = [];
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const gx =
+        -gray[(y-1)*width+(x-1)] + gray[(y-1)*width+(x+1)]
+        -2*gray[y*width+(x-1)]   + 2*gray[y*width+(x+1)]
+        -gray[(y+1)*width+(x-1)] + gray[(y+1)*width+(x+1)];
+      const gy =
+        -gray[(y-1)*width+(x-1)] - 2*gray[(y-1)*width+x] - gray[(y-1)*width+(x+1)]
+        +gray[(y+1)*width+(x-1)] + 2*gray[(y+1)*width+x] + gray[(y+1)*width+(x+1)];
+      const mag = Math.sqrt(gx*gx + gy*gy);
+      if (mag > threshold) edges.push({ x, y, mag });
+    }
+  }
+  return edges;
+}
+ 
+// ─── Stroke generator ─────────────────────────────────────────────────────
+function generateStrokes(imageData, settings) {
+  const { width, height } = imageData;
+  const { brushSize, density, artisticMode } = settings;
+  const data = imageData.data;
+  const strokes = [];
+  const step = brushSize === "small" ? 4 : brushSize === "large" ? 12 : 7;
+  const densityMult = density === "low" ? 2 : density === "high" ? 0.5 : 1;
+  const actualStep = Math.max(2, Math.round(step * densityMult));
+ 
+  // Phase 0: background sweeps
+  const bgStrokeCount = 8;
+  for (let i = 0; i < bgStrokeCount; i++) {
+    const y = (height / bgStrokeCount) * i + height / (bgStrokeCount * 2);
+    const pts = [];
+    for (let x = 0; x < width; x += Math.max(20, width / 8)) {
+      const px = Math.floor(clamp(x, 0, width-1));
+      const py = Math.floor(clamp(y, 0, height-1));
+      const idx = (py * width + px) * 4;
+      pts.push({ x, y, r: data[idx], g: data[idx+1], b: data[idx+2] });
+    }
+    if (pts.length > 1)
+      strokes.push({ type:"sweep", points:pts, width: brushSize==="large"?40:25, phase:0, cx: pts[Math.floor(pts.length/2)].x, cy: y });
+  }
+ 
+  // Phase 1: color block strokes
+  for (let y = 0; y < height; y += actualStep*3) {
+    for (let x = 0; x < width; x += actualStep*2) {
+      const idx = (Math.floor(y)*width + Math.floor(x))*4;
+      const r=data[idx], g=data[idx+1], b=data[idx+2];
+      const len = artisticMode ? actualStep*4 : actualStep*2;
+      const angle = artisticMode ? (Math.random()*Math.PI*2) : 0;
+      strokes.push({ type:"brush", x, y, r, g, b, len, angle, width:actualStep*1.5, phase:1, cx:x, cy:y });
+    }
+  }
+ 
+  // Phase 2: edge strokes
+  const edges = detectEdges(imageData, 25);
+  const edgeSample = Math.floor(edges.length / (density==="low"?8:density==="high"?2:4));
+  for (let i = 0; i < edges.length; i += Math.max(1, Math.floor(edges.length/edgeSample))) {
+    const e = edges[i]; if (!e) continue;
+    const idx = (e.y*width+e.x)*4;
+    strokes.push({ type:"edge", x:e.x, y:e.y, r:data[idx], g:data[idx+1], b:data[idx+2], width:brushSize==="small"?1:2, phase:2, cx:e.x, cy:e.y });
+  }
+ 
+  // Phase 3: fine detail
+  for (let y = 0; y < height; y += actualStep) {
+    for (let x = 0; x < width; x += actualStep) {
+      const idx = (Math.floor(y)*width+Math.floor(x))*4;
+      const r=data[idx], g=data[idx+1], b=data[idx+2];
+      strokes.push({ type:"detail", x, y, r, g, b, width:Math.max(1,actualStep*0.5), phase:3, cx:x, cy:y });
+    }
+  }
+  return strokes;
+}
+ 
+// ─── Get current brush tip position from strokes + progress ───────────────
+function getBrushPosition(strokes, progress) {
+  const phases = [0,1,2,3];
+  const phaseBounds = [0.15, 0.45, 0.75, 1.0];
+  let lastX = 0, lastY = 0, found = false;
+  for (const phase of phases) {
+    const phaseStart = phase===0 ? 0 : phaseBounds[phase-1];
+    const phaseEnd = phaseBounds[phase];
+    const phaseProgress = clamp((progress-phaseStart)/(phaseEnd-phaseStart),0,1);
+    const phaseStrokes = strokes.filter(s=>s.phase===phase);
+    const count = Math.floor(phaseStrokes.length * phaseProgress);
+    if (count > 0) {
+      const s = phaseStrokes[count-1];
+      lastX = s.cx !== undefined ? s.cx : s.x;
+      lastY = s.cy !== undefined ? s.cy : s.y;
+      found = true;
+    }
+  }
+  return found ? { x: lastX, y: lastY } : null;
+}
+ 
+// ─── Canvas renderer ──────────────────────────────────────────────────────
+function renderFrame(ctx, strokes, progress, imgWidth, imgHeight, background) {
+  ctx.clearRect(0,0,imgWidth,imgHeight);
+  if (background==="white") { ctx.fillStyle="#ffffff"; ctx.fillRect(0,0,imgWidth,imgHeight); }
+  else if (background==="dark") { ctx.fillStyle="#1a1a2e"; ctx.fillRect(0,0,imgWidth,imgHeight); }
+ 
+  const phases=[0,1,2,3];
+  const phaseBounds=[0.15,0.45,0.75,1.0];
+ 
+  for (const phase of phases) {
+    const phaseStart = phase===0 ? 0 : phaseBounds[phase-1];
+    const phaseEnd = phaseBounds[phase];
+    const phaseProgress = clamp((progress-phaseStart)/(phaseEnd-phaseStart),0,1);
+    const phaseStrokes = strokes.filter(s=>s.phase===phase);
+    const count = Math.floor(phaseStrokes.length * phaseProgress);
+ 
+    for (let i=0; i<count; i++) {
+      const s = phaseStrokes[i];
+      ctx.globalAlpha = 0.85;
+      const color = `rgb(${s.r},${s.g},${s.b})`;
+ 
+      if (s.type==="sweep" && s.points) {
+        ctx.beginPath();
+        ctx.moveTo(s.points[0].x, s.points[0].y);
+        for (let p=1; p<s.points.length; p++) ctx.lineTo(s.points[p].x, s.points[p].y);
+        ctx.strokeStyle = `rgb(${s.points[0].r},${s.points[0].g},${s.points[0].b})`;
+        ctx.lineWidth = s.width; ctx.lineCap="round"; ctx.stroke();
+      } else if (s.type==="brush") {
+        ctx.beginPath();
+        const ex = s.x+Math.cos(s.angle)*s.len, ey = s.y+Math.sin(s.angle)*s.len;
+        ctx.moveTo(s.x,s.y); ctx.lineTo(ex,ey);
+        ctx.strokeStyle=color; ctx.lineWidth=s.width; ctx.lineCap="round"; ctx.stroke();
+      } else if (s.type==="edge") {
+        ctx.beginPath();
+        ctx.arc(s.x,s.y,s.width,0,Math.PI*2);
+        ctx.fillStyle=color; ctx.fill();
+      } else if (s.type==="detail") {
+        ctx.fillStyle=color; ctx.globalAlpha=0.6;
+        ctx.fillRect(s.x,s.y,s.width+0.5,s.width+0.5);
+      }
+    }
+  }
+  ctx.globalAlpha=1;
+}
+ 
+// ─── Export ───────────────────────────────────────────────────────────────
+async function exportVideoFrames(strokes, imgWidth, imgHeight, background, duration, fps, onProgress) {
+  const offscreen = document.createElement("canvas");
+  offscreen.width = imgWidth; offscreen.height = imgHeight;
+  const octx = offscreen.getContext("2d");
+  const totalFrames = Math.floor(duration * fps);
+  const chunks = [];
+  const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm";
+  const stream = offscreen.captureStream(fps);
+  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond:8000000 });
+  recorder.ondataavailable = e => { if (e.data.size>0) chunks.push(e.data); };
+  const done = new Promise(res => { recorder.onstop = res; });
+  recorder.start();
+  for (let f=0; f<totalFrames; f++) {
+    const progress = f/(totalFrames-1);
+    renderFrame(octx, strokes, progress, imgWidth, imgHeight, background);
+    onProgress(Math.round((f/totalFrames)*100));
+    await new Promise(r=>setTimeout(r, 1000/fps));
+  }
+  recorder.stop();
+  await done;
+  return new Blob(chunks, { type:"video/webm" });
+}
+ 
+// ─── HAND SVG (realistic holding a brush/pencil) ─────────────────────────
+// A right hand gripping a pencil, drawn in SVG paths
+// The tip of the pencil is at (0,0) in SVG coords — we translate so tip = brush position
+function HandSVG({ scale = 1, brushType = "pencil" }) {
+  // skin tones
+  const skin = "#f5c5a3";
+  const skinDark = "#e8a882";
+  const skinDeep = "#d4936a";
+  const nail = "#f9e0d0";
+ 
+  return (
+    <svg
+      width={120 * scale}
+      height={160 * scale}
+      viewBox="0 0 120 160"
+      style={{ overflow:"visible", filter:"drop-shadow(2px 4px 8px rgba(0,0,0,0.35))", pointerEvents:"none" }}
+    >
+      {/* Pencil / brush tool */}
+      {brushType === "pencil" ? (
+        <g transform="translate(18, -10) rotate(-35, 18, 60)">
+          {/* pencil body */}
+          <rect x="14" y="5" width="8" height="80" rx="1" fill="#f5c842" />
+          {/* pencil stripe */}
+          <rect x="14" y="5" width="8" height="6" rx="1" fill="#e8b800" />
+          {/* pencil eraser */}
+          <rect x="14" y="0" width="8" height="8" rx="2" fill="#ff8fa0" />
+          <rect x="14" y="6" width="8" height="3" fill="#c0c0c0" />
+          {/* pencil tip cone */}
+          <polygon points="14,85 22,85 18,100" fill={skinDark} />
+          <polygon points="16,92 20,92 18,100" fill="#2a1a0a" />
+          {/* graphite tip */}
+          <circle cx="18" cy="100" r="1.2" fill="#555" />
+        </g>
+      ) : (
+        <g transform="translate(16, -8) rotate(-30, 18, 60)">
+          {/* brush handle */}
+          <rect x="15" y="5" width="6" height="72" rx="2" fill="#8B4513" />
+          {/* ferrule */}
+          <rect x="13" y="72" width="10" height="10" rx="1" fill="#aaa" />
+          {/* bristles */}
+          <ellipse cx="18" cy="90" rx="5" ry="12" fill="#2a1a0a" />
+          <ellipse cx="18" cy="98" rx="3" ry="6" fill="#111" />
+          {/* tip */}
+          <ellipse cx="18" cy="105" rx="1.5" ry="3" fill="#1a0a00" />
+        </g>
+      )}
+ 
+      {/* PALM base */}
+      <ellipse cx="58" cy="118" rx="30" ry="28" fill={skin} />
+      <ellipse cx="58" cy="130" rx="30" ry="20" fill={skin} />
+ 
+      {/* WRIST */}
+      <rect x="36" y="135" width="44" height="30" rx="8" fill={skin} />
+      {/* wrist crease lines */}
+      <path d="M 40 145 Q 58 142 76 145" stroke={skinDeep} strokeWidth="1" fill="none" opacity="0.6" />
+      <path d="M 42 152 Q 58 149 74 152" stroke={skinDeep} strokeWidth="1" fill="none" opacity="0.4" />
+ 
+      {/* PINKY finger — curled */}
+      <ellipse cx="31" cy="108" rx="8" ry="14" fill={skin} transform="rotate(-15,31,108)" />
+      <ellipse cx="28" cy="96" rx="6" ry="10" fill={skin} transform="rotate(-20,28,96)" />
+      {/* pinky nail */}
+      <ellipse cx="26" cy="89" rx="4" ry="3" fill={nail} transform="rotate(-20,26,89)" />
+      {/* pinky knuckle lines */}
+      <path d="M 24 102 Q 28 100 32 102" stroke={skinDeep} strokeWidth="0.8" fill="none" opacity="0.5" />
+ 
+      {/* RING finger — curled */}
+      <ellipse cx="44" cy="98" rx="8" ry="16" fill={skin} transform="rotate(-8,44,98)" />
+      <ellipse cx="43" cy="84" rx="6.5" ry="12" fill={skin} transform="rotate(-10,43,84)" />
+      <ellipse cx="42" cy="75" rx="5" ry="5" fill={nail} transform="rotate(-10,42,75)" />
+      <path d="M 38 92 Q 43 90 48 92" stroke={skinDeep} strokeWidth="0.8" fill="none" opacity="0.5" />
+ 
+      {/* MIDDLE finger — mostly curled, gripping */}
+      <ellipse cx="58" cy="92" rx="8" ry="17" fill={skin} transform="rotate(2,58,92)" />
+      <ellipse cx="58" cy="77" rx="7" ry="13" fill={skin} transform="rotate(2,58,77)" />
+      <ellipse cx="58" cy="67" rx="5.5" ry="5" fill={nail} />
+      <path d="M 52 87 Q 58 85 64 87" stroke={skinDeep} strokeWidth="0.8" fill="none" opacity="0.5" />
+ 
+      {/* INDEX finger — extended/gripping pencil */}
+      <ellipse cx="71" cy="90" rx="8" ry="18" fill={skin} transform="rotate(12,71,90)" />
+      <ellipse cx="75" cy="74" rx="7" ry="14" fill={skin} transform="rotate(14,75,74)" />
+      <ellipse cx="78" cy="63" rx="5.5" ry="5" fill={nail} transform="rotate(14,78,63)" />
+      <path d="M 68 85 Q 73 83 78 85" stroke={skinDeep} strokeWidth="0.8" fill="none" opacity="0.5" />
+ 
+      {/* THUMB — coming from left side gripping */}
+      <ellipse cx="36" cy="98" rx="10" ry="16" fill={skin} transform="rotate(-40,36,98)" />
+      <ellipse cx="28" cy="85" rx="8" ry="12" fill={skinDark} transform="rotate(-45,28,85)" />
+      <ellipse cx="22" cy="77" rx="7" ry="6" fill={nail} transform="rotate(-45,22,77)" />
+ 
+      {/* Palm shadow / depth */}
+      <ellipse cx="55" cy="120" rx="25" ry="16" fill={skinDark} opacity="0.25" />
+ 
+      {/* Knuckle highlights on top of hand */}
+      <ellipse cx="44" cy="112" rx="5" ry="3" fill="#fff" opacity="0.12" />
+      <ellipse cx="58" cy="108" rx="5" ry="3" fill="#fff" opacity="0.12" />
+      <ellipse cx="70" cy="112" rx="5" ry="3" fill="#fff" opacity="0.12" />
+    </svg>
+  );
+}
+ 
+// ─── Upload Page ──────────────────────────────────────────────────────────
+function UploadPage({ onUpload, darkMode }) {
+  const [dragging, setDragging] = useState(false);
+  const [error, setError] = useState("");
+  const inputRef = useRef();
+ 
+  const handleFile = useCallback((file) => {
+    setError("");
+    if (!file) return;
+    const allowed = ["image/jpeg","image/png","image/webp"];
+    if (!allowed.includes(file.type)) { setError("Please upload a JPG, PNG, or WEBP image."); return; }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let w=img.width, h=img.height;
+        const maxDim=1920;
+        if (w>maxDim||h>maxDim) { const r=Math.min(maxDim/w,maxDim/h); w=Math.round(w*r); h=Math.round(h*r); }
+        const c=document.createElement("canvas"); c.width=w; c.height=h;
+        const ctx=c.getContext("2d"); ctx.drawImage(img,0,0,w,h);
+        const imageData=ctx.getImageData(0,0,w,h);
+        onUpload({ src:c.toDataURL("image/png"), imageData, width:w, height:h, name:file.name });
+      };
+      img.src=e.target.result;
+    };
+    reader.readAsDataURL(file);
+  }, [onUpload]);
+ 
+  const bg = darkMode ? "#0f0f1a" : "#f8f8fc";
+  const card = darkMode ? "#1a1a2e" : "#ffffff";
+  const text = darkMode ? "#e8e8f0" : "#1a1a2e";
+  const muted = darkMode ? "#888" : "#999";
+  const accent = "#7c5cbf";
+  const border = dragging ? accent : (darkMode ? "#333355" : "#e0e0ef");
+ 
+  return (
+    <div style={{ minHeight:"100vh", background:bg, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:"2rem" }}>
+      <div style={{ textAlign:"center", marginBottom:"2.5rem" }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12, marginBottom:"0.5rem" }}>
+          <div style={{ width:44, height:44, background:"linear-gradient(135deg,#7c5cbf,#c459f0)", borderRadius:12, display:"flex", alignItems:"center", justifyContent:"center" }}>
+            <svg width="24" height="24" fill="none" viewBox="0 0 24 24"><path d="M3 17l4-8 4 5 3-3 5 6" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          </div>
+          <span style={{ fontSize:26, fontWeight:700, color:text, letterSpacing:"-0.5px" }}>SpeedPaint Studio</span>
+        </div>
+        <p style={{ color:muted, fontSize:15, margin:0 }}>Upload an image → watch a hand draw it → export as video</p>
+      </div>
+ 
+      <div
+        onDragOver={e=>{e.preventDefault();setDragging(true);}}
+        onDragLeave={()=>setDragging(false)}
+        onDrop={e=>{e.preventDefault();setDragging(false);handleFile(e.dataTransfer.files[0]);}}
+        onClick={()=>inputRef.current.click()}
+        style={{ width:"100%", maxWidth:520, background:dragging?(darkMode?"#1e1e35":"#f0ecff"):card, border:`2px dashed ${border}`, borderRadius:20, padding:"4rem 2rem", textAlign:"center", cursor:"pointer", transition:"all 0.2s" }}
+      >
+        {/* Hand preview */}
+        <div style={{ display:"flex", justifyContent:"center", marginBottom:"1.2rem", opacity:0.9 }}>
+          <HandSVG scale={0.8} brushType="pencil" />
+        </div>
+        <p style={{ fontSize:18, fontWeight:600, color:text, margin:"0 0 0.5rem" }}>Drop your image here</p>
+        <p style={{ fontSize:14, color:muted, margin:"0 0 1.5rem" }}>JPG, PNG, WEBP — up to 20MB</p>
+        <button
+          style={{ background:accent, color:"#fff", border:"none", borderRadius:10, padding:"12px 28px", fontSize:15, fontWeight:600, cursor:"pointer" }}
+          onClick={e=>{e.stopPropagation();inputRef.current.click();}}
+        >Browse Files</button>
+        <input ref={inputRef} type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" style={{display:"none"}} onChange={e=>handleFile(e.target.files[0])} />
+      </div>
+      {error && <p style={{ color:"#e05", marginTop:"1rem", fontSize:14 }}>{error}</p>}
+ 
+      <div style={{ marginTop:"2rem", display:"flex", gap:10 }}>
+        {[["🎬 15s TikTok","9:16"],["📱 60s Shorts","9:16"],["▶ YouTube","16:9"]].map(([label,ratio])=>(
+          <div key={label} style={{ background:card, color:text, border:`1.5px solid ${border}`, borderRadius:8, padding:"8px 14px", fontSize:13, fontWeight:500 }}>{label}</div>
+        ))}
+      </div>
+    </div>
+  );
+}
+ 
+// ─── Studio Page ──────────────────────────────────────────────────────────
+function StudioPage({ image, onBack, darkMode, toggleDark }) {
+  const canvasRef = useRef();
+  const overlayRef = useRef();       // overlay canvas for hand composite
+  const animRef = useRef();
+  const [strokes, setStrokes] = useState([]);
+  const [processing, setProcessing] = useState(true);
+  const [processingPct, setProcessingPct] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [speed, setSpeed] = useState(1);
+  const [duration, setDuration] = useState(30);
+  const [brushSize, setBrushSize] = useState("medium");
+  const [density, setDensity] = useState("medium");
+  const [artisticMode, setArtisticMode] = useState(false);
+  const [background, setBackground] = useState("white");
+  const [showHand, setShowHand] = useState(true);
+  const [brushType, setBrushType] = useState("pencil"); // pencil | brush
+  const [handPos, setHandPos] = useState({ x:0, y:0 });
+  const [exportProgress, setExportProgress] = useState(-1);
+  const [exportDone, setExportDone] = useState(null);
+  const [resolution, setResolution] = useState("1080p");
+  const [fps, setFps] = useState(30);
+  const [aspect, setAspect] = useState("16:9");
+  const lastTimeRef = useRef(null);
+  const progressRef = useRef(0);
+  const playingRef = useRef(false);
+  const strokesRef = useRef([]);
+  // smoothed hand position for lerping
+  const smoothPosRef = useRef({ x:0, y:0 });
+  const canvasBoundsRef = useRef({ left:0, top:0, scaleX:1, scaleY:1 });
+ 
+  const bg = darkMode ? "#0f0f1a" : "#f4f4f8";
+  const panel = darkMode ? "#1a1a2e" : "#ffffff";
+  const text = darkMode ? "#e8e8f0" : "#1a1a2e";
+  const muted = darkMode ? "#8888aa" : "#888";
+  const border = darkMode ? "#2a2a45" : "#e8e8f0";
+  const accent = "#7c5cbf";
+ 
+  // Process image into strokes
+  useEffect(()=>{
+    if (!image) return;
+    setProcessing(true); setProcessingPct(0); setStrokes([]); setProgress(0); strokesRef.current=[];
+    setTimeout(()=>{
+      setProcessingPct(20);
+      setTimeout(()=>{
+        setProcessingPct(60);
+        const s=generateStrokes(image.imageData,{brushSize,density,artisticMode});
+        strokesRef.current=s;
+        setProcessingPct(90);
+        setTimeout(()=>{ setStrokes(s); setProcessing(false); setProcessingPct(100); setProgress(0); },100);
+      },150);
+    },50);
+  },[image,brushSize,density,artisticMode]);
+ 
+  // Draw frame when progress/strokes/background changes
+  useEffect(()=>{
+    if (!canvasRef.current || !strokes.length) return;
+    const ctx=canvasRef.current.getContext("2d");
+    renderFrame(ctx,strokes,progress,image.width,image.height,background);
+  },[progress,strokes,background,image]);
+ 
+  // Track hand position
+  useEffect(()=>{
+    if (!strokes.length || !showHand) return;
+    const pos=getBrushPosition(strokes,progress);
+    if (pos) setHandPos(pos);
+  },[progress,strokes,showHand]);
+ 
+  // Update canvas bounds for hand positioning
+  useEffect(()=>{
+    const updateBounds=()=>{
+      if (!canvasRef.current) return;
+      const rect=canvasRef.current.getBoundingClientRect();
+      canvasBoundsRef.current={
+        left:rect.left, top:rect.top,
+        scaleX: rect.width/image.width,
+        scaleY: rect.height/image.height,
+        width: rect.width, height: rect.height
+      };
+    };
+    updateBounds();
+    window.addEventListener("resize",updateBounds);
+    return ()=>window.removeEventListener("resize",updateBounds);
+  },[image, progress]);
+ 
+  useEffect(()=>{ playingRef.current=playing; },[playing]);
+  useEffect(()=>{ progressRef.current=progress; },[progress]);
+ 
+  useEffect(()=>{
+    if (playing) {
+      lastTimeRef.current=null;
+      const loop=(ts)=>{
+        if (!playingRef.current) return;
+        if (lastTimeRef.current!==null) {
+          const dt=(ts-lastTimeRef.current)/1000;
+          const inc=(dt*speed)/duration;
+          const next=Math.min(1,progressRef.current+inc);
+          setProgress(next);
+          progressRef.current=next;
+          if (next>=1) { setPlaying(false); return; }
+        }
+        lastTimeRef.current=ts;
+        animRef.current=requestAnimationFrame(loop);
+      };
+      animRef.current=requestAnimationFrame(loop);
+      return ()=>cancelAnimationFrame(animRef.current);
+    }
+  },[playing,speed,duration]);
+ 
+  const restart=()=>{ setProgress(0); setPlaying(false); };
+ 
+  const handleExport=async()=>{
+    if (exportProgress>=0) return;
+    setExportDone(null); setExportProgress(0);
+    try {
+      const blob=await exportVideoFrames(strokes,image.width,image.height,background,duration,fps,pct=>setExportProgress(pct));
+      setExportDone(URL.createObjectURL(blob));
+      setExportProgress(-1);
+    } catch(err) {
+      setExportProgress(-1);
+      alert("Export failed: "+err.message);
+    }
+  };
+ 
+  const Slider=({label,value,min,max,step=1,onChange,fmt=v=>v})=>(
+    <div style={{marginBottom:16}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+        <span style={{fontSize:13,color:muted}}>{label}</span>
+        <span style={{fontSize:13,fontWeight:600,color:accent}}>{fmt(value)}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e=>onChange(Number(e.target.value))} style={{width:"100%",accentColor:accent}} />
+    </div>
+  );
+ 
+  const Toggle=({label,value,onChange})=>(
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+      <span style={{fontSize:13,color:text}}>{label}</span>
+      <div onClick={()=>onChange(!value)} style={{ width:40,height:22,borderRadius:11,background:value?accent:(darkMode?"#333":"#ddd"),cursor:"pointer",transition:"background 0.2s",position:"relative" }}>
+        <div style={{position:"absolute",top:3,left:value?21:3,width:16,height:16,borderRadius:"50%",background:"#fff",transition:"left 0.2s"}} />
+      </div>
+    </div>
+  );
+ 
+  const SegBtn=({options,value,onChange,small})=>(
+    <div style={{display:"flex",gap:4,background:darkMode?"#131325":"#f0f0f8",borderRadius:8,padding:3}}>
+      {options.map(o=>(
+        <button key={o} onClick={()=>onChange(o)} style={{ flex:1,background:value===o?accent:"transparent",color:value===o?"#fff":muted,border:"none",borderRadius:6,padding:small?"5px 8px":"7px 10px",fontSize:small?12:13,fontWeight:500,cursor:"pointer",transition:"all 0.15s" }}>{o}</button>
+      ))}
+    </div>
+  );
+ 
+  // Hand position on screen (scaled from image coords to display coords)
+  const canvasEl = canvasRef.current;
+  let handScreenX = 0, handScreenY = 0;
+  if (canvasEl) {
+    const rect = canvasEl.getBoundingClientRect();
+    const scaleX = rect.width / image.width;
+    const scaleY = rect.height / image.height;
+    handScreenX = handPos.x * scaleX;
+    handScreenY = handPos.y * scaleY;
+  }
+ 
+  return (
+    <div style={{minHeight:"100vh",background:bg,fontFamily:"'DM Sans','Segoe UI',sans-serif",color:text}}>
+      {/* Top bar */}
+      <div style={{background:panel,borderBottom:`1px solid ${border}`,padding:"0 1.5rem",height:56,display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <button onClick={onBack} style={{background:"none",border:"none",color:muted,cursor:"pointer",padding:6,borderRadius:6,fontSize:20,lineHeight:1}}>←</button>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <div style={{width:28,height:28,background:"linear-gradient(135deg,#7c5cbf,#c459f0)",borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center"}}>
+              <svg width="14" height="14" fill="none" viewBox="0 0 24 24"><path d="M3 17l4-8 4 5 3-3 5 6" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </div>
+            <span style={{fontWeight:700,fontSize:16}}>SpeedPaint Studio</span>
+          </div>
+          {image && <span style={{fontSize:13,color:muted,background:darkMode?"#1e1e35":"#f0f0f8",padding:"3px 10px",borderRadius:6}}>{image.name}</span>}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <button onClick={toggleDark} style={{background:darkMode?"#242440":"#f0f0f8",border:"none",borderRadius:8,padding:"7px 12px",cursor:"pointer",color:text,fontSize:13}}>
+            {darkMode ? "☀ Light" : "🌙 Dark"}
+          </button>
+        </div>
+      </div>
+ 
+      <div style={{display:"flex",height:"calc(100vh - 56px)",overflow:"hidden"}}>
+        {/* Left panel */}
+        <div style={{width:240,background:panel,borderRight:`1px solid ${border}`,overflowY:"auto",flexShrink:0}}>
+          <div style={{padding:"1rem"}}>
+            <p style={{fontSize:11,fontWeight:700,color:muted,textTransform:"uppercase",letterSpacing:1,margin:"0 0 12px"}}>Brush Settings</p>
+ 
+            <div style={{marginBottom:16}}>
+              <p style={{fontSize:13,color:muted,margin:"0 0 8px"}}>Brush Size</p>
+              <SegBtn options={["small","medium","large"]} value={brushSize} onChange={setBrushSize} small />
+            </div>
+            <div style={{marginBottom:16}}>
+              <p style={{fontSize:13,color:muted,margin:"0 0 8px"}}>Stroke Density</p>
+              <SegBtn options={["low","medium","high"]} value={density} onChange={setDensity} small />
+            </div>
+            <Toggle label="Artistic Mode" value={artisticMode} onChange={setArtisticMode} />
+ 
+            <div style={{height:1,background:border,margin:"16px 0"}} />
+            <p style={{fontSize:11,fontWeight:700,color:muted,textTransform:"uppercase",letterSpacing:1,margin:"0 0 12px"}}>Hand Settings</p>
+            <Toggle label="Show Drawing Hand" value={showHand} onChange={setShowHand} />
+            {showHand && (
+              <div style={{marginBottom:12}}>
+                <p style={{fontSize:13,color:muted,margin:"0 0 8px"}}>Tool Type</p>
+                <SegBtn options={["pencil","brush"]} value={brushType} onChange={setBrushType} small />
+              </div>
+            )}
+ 
+            <div style={{height:1,background:border,margin:"16px 0"}} />
+            <p style={{fontSize:11,fontWeight:700,color:muted,textTransform:"uppercase",letterSpacing:1,margin:"0 0 12px"}}>Canvas Background</p>
+            <SegBtn options={["white","dark","transparent"]} value={background} onChange={setBackground} small />
+ 
+            <div style={{height:1,background:border,margin:"16px 0"}} />
+            <p style={{fontSize:11,fontWeight:700,color:muted,textTransform:"uppercase",letterSpacing:1,margin:"0 0 12px"}}>Aspect Ratio</p>
+            <SegBtn options={["16:9","9:16","1:1"]} value={aspect} onChange={setAspect} small />
+ 
+            {processing && (
+              <div style={{marginTop:16,background:darkMode?"#131325":"#f8f0ff",borderRadius:10,padding:"12px 14px"}}>
+                <p style={{fontSize:13,fontWeight:600,color:accent,margin:"0 0 8px"}}>Analyzing image… {processingPct}%</p>
+                <div style={{background:darkMode?"#242440":"#e8e0f8",borderRadius:4,height:4}}>
+                  <div style={{background:accent,borderRadius:4,height:4,width:`${processingPct}%`,transition:"width 0.3s"}} />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+ 
+        {/* Center canvas area */}
+        <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"1.5rem",overflow:"auto"}}>
+ 
+          {/* Canvas + hand overlay wrapper */}
+          <div style={{position:"relative",boxShadow:"0 8px 40px rgba(0,0,0,0.2)",borderRadius:12,overflow:"visible",display:"inline-block"}}>
+ 
+            {/* Main drawing canvas */}
+            <canvas
+              ref={canvasRef}
+              width={image.width}
+              height={image.height}
+              style={{display:"block",maxWidth:"min(100%,640px)",maxHeight:"50vh",width:"auto",height:"auto",borderRadius:12}}
+            />
+ 
+            {/* Hand overlay — absolutely positioned over canvas */}
+            {showHand && !processing && (
+              <div
+                style={{
+                  position:"absolute",
+                  // tip of pencil is at ~(18, 100) in the SVG (120x160 viewBox)
+                  // offset so the pencil tip lands exactly on the brush position
+                  left: handScreenX - 36,   // 18/120 * 120*scale adjusted
+                  top:  handScreenY - 90,   // tip is ~100/160 down the SVG
+                  pointerEvents:"none",
+                  zIndex:20,
+                  transition: playing ? "left 0.05s linear, top 0.05s linear" : "none",
+                  willChange:"transform"
+                }}
+              >
+                <HandSVG scale={canvasEl ? Math.max(0.5, Math.min(1.2, canvasEl.getBoundingClientRect().width / 500)) : 0.85} brushType={brushType} />
+              </div>
+            )}
+ 
+            {/* Processing overlay */}
+            {processing && (
+              <div style={{position:"absolute",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",borderRadius:12}}>
+                <div style={{width:48,height:48,border:"3px solid #fff3",borderTop:`3px solid ${accent}`,borderRadius:"50%",animation:"spin 0.8s linear infinite"}} />
+                <p style={{color:"#fff",marginTop:12,fontSize:14}}>Generating strokes… {processingPct}%</p>
+              </div>
+            )}
+          </div>
+ 
+          {/* Timeline + playback */}
+          <div style={{width:"100%",maxWidth:660,marginTop:"1.5rem"}}>
+            {/* Scrubber */}
+            <div style={{position:"relative",marginBottom:12}}>
+              <input type="range" min={0} max={1} step={0.001} value={progress}
+                onChange={e=>{setProgress(Number(e.target.value));setPlaying(false);}}
+                style={{width:"100%",accentColor:accent,height:6}} />
+              <div style={{display:"flex",justifyContent:"space-between",marginTop:4}}>
+                <span style={{fontSize:12,color:muted}}>{formatTime(progress*duration)}</span>
+                <span style={{fontSize:12,color:muted}}>{formatTime(duration)}</span>
+              </div>
+            </div>
+ 
+            {/* Playback row */}
+            <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:12,marginBottom:16}}>
+              <button onClick={restart} style={{background:darkMode?"#242440":"#f0f0f8",border:"none",borderRadius:8,width:40,height:40,cursor:"pointer",color:text,fontSize:18,display:"flex",alignItems:"center",justifyContent:"center"}} title="Restart">⟳</button>
+              <button
+                disabled={processing}
+                onClick={()=>setPlaying(p=>!p)}
+                style={{background:accent,border:"none",borderRadius:12,width:56,height:56,cursor:processing?"not-allowed":"pointer",color:"#fff",fontSize:22,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 4px 16px ${accent}55`,opacity:processing?0.5:1}}
+              >{playing?"⏸":"▶"}</button>
+              <button onClick={()=>{setProgress(1);setPlaying(false);}} style={{background:darkMode?"#242440":"#f0f0f8",border:"none",borderRadius:8,width:40,height:40,cursor:"pointer",color:text,fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}} title="Skip to end">⏭</button>
+            </div>
+ 
+            {/* Speed + Duration */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+              <Slider label="Speed" value={speed} min={0.5} max={10} step={0.5} onChange={setSpeed} fmt={v=>`${v}x`} />
+              <Slider label="Duration" value={duration} min={10} max={600} step={10} onChange={setDuration} fmt={v=>formatTime(v)} />
+            </div>
+          </div>
+        </div>
+ 
+        {/* Right panel */}
+        <div style={{width:240,background:panel,borderLeft:`1px solid ${border}`,overflowY:"auto",flexShrink:0}}>
+          <div style={{padding:"1rem"}}>
+            <p style={{fontSize:11,fontWeight:700,color:muted,textTransform:"uppercase",letterSpacing:1,margin:"0 0 16px"}}>Export Video</p>
+ 
+            <div style={{marginBottom:14}}>
+              <p style={{fontSize:13,color:muted,margin:"0 0 8px"}}>Resolution</p>
+              <SegBtn options={["720p","1080p","4K"]} value={resolution} onChange={setResolution} small />
+              {resolution==="4K" && <p style={{fontSize:11,color:"#f5a623",marginTop:6}}>⚠ 4K may be slow</p>}
+            </div>
+ 
+            <div style={{marginBottom:14}}>
+              <p style={{fontSize:13,color:muted,margin:"0 0 8px"}}>Frame Rate</p>
+              <SegBtn options={["30","60"]} value={String(fps)} onChange={v=>setFps(Number(v))} small />
+            </div>
+ 
+            <div style={{height:1,background:border,margin:"16px 0"}} />
+            <p style={{fontSize:11,fontWeight:700,color:muted,textTransform:"uppercase",letterSpacing:1,margin:"0 0 12px"}}>Presets</p>
+            {[["🎬 TikTok 15s",15,"9:16"],["📱 YT Shorts 60s",60,"9:16"],["▶ YouTube 2min",120,"16:9"],["📸 Instagram 1:1",30,"1:1"]].map(([label,d,a])=>(
+              <button key={label} onClick={()=>{setDuration(d);setAspect(a);}} style={{ width:"100%",background:darkMode?"#131325":"#f8f8fc",border:`1px solid ${border}`,borderRadius:8,padding:"8px 12px",textAlign:"left",cursor:"pointer",color:text,fontSize:13,marginBottom:6,display:"flex",alignItems:"center",justifyContent:"space-between" }}>
+                <span>{label}</span>
+                <span style={{fontSize:11,color:muted}}>{a}</span>
+              </button>
+            ))}
+ 
+            <div style={{height:1,background:border,margin:"16px 0"}} />
+ 
+            {exportProgress>=0 ? (
+              <div>
+                <p style={{fontSize:13,fontWeight:600,color:accent,margin:"0 0 8px"}}>Exporting… {exportProgress}%</p>
+                <div style={{background:darkMode?"#242440":"#f0eaf8",borderRadius:4,height:6}}>
+                  <div style={{background:accent,borderRadius:4,height:6,width:`${exportProgress}%`,transition:"width 0.2s"}} />
+                </div>
+                <p style={{fontSize:11,color:muted,marginTop:8}}>Rendering frame by frame…</p>
+              </div>
+            ) : exportDone ? (
+              <div>
+                <p style={{fontSize:13,fontWeight:600,color:"#22c55e",marginBottom:10}}>✓ Export ready!</p>
+                <a href={exportDone} download="speedpaint.webm" style={{display:"block",background:"#22c55e",color:"#fff",borderRadius:10,padding:"12px",textAlign:"center",textDecoration:"none",fontWeight:600,fontSize:14,marginBottom:8}}>⬇ Download WebM</a>
+                <button onClick={()=>setExportDone(null)} style={{width:"100%",background:"none",border:`1px solid ${border}`,borderRadius:8,padding:"8px",color:muted,cursor:"pointer",fontSize:13}}>Export Again</button>
+              </div>
+            ) : (
+              <button
+                onClick={handleExport}
+                disabled={processing||!strokes.length}
+                style={{ width:"100%",background:accent,color:"#fff",border:"none",borderRadius:12,padding:"14px",fontSize:15,fontWeight:700,cursor:(processing||!strokes.length)?"not-allowed":"pointer",opacity:(processing||!strokes.length)?0.5:1,transition:"opacity 0.2s",boxShadow:`0 4px 16px ${accent}44` }}
+              >Export Video</button>
+            )}
+            <p style={{fontSize:11,color:muted,marginTop:8,textAlign:"center"}}>WebM · Chrome, Firefox, Edge</p>
+ 
+            {/* Hand in export note */}
+            {showHand && (
+              <div style={{marginTop:12,background:darkMode?"#131325":"#f8f0ff",borderRadius:8,padding:"8px 10px"}}>
+                <p style={{fontSize:11,color:muted,margin:0}}>💡 Hand is a preview overlay only. Export renders the clean painting without the hand.</p>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+ 
+      <style>{`
+        @keyframes spin { to { transform:rotate(360deg); } }
+        input[type=range] { cursor:pointer; }
+        * { box-sizing:border-box; }
+      `}</style>
+    </div>
+  );
+}
+ 
+// ─── App Root ─────────────────────────────────────────────────────────────
+export default function SpeedPaintStudio() {
+  const [page, setPage] = useState("upload");
+  const [image, setImage] = useState(null);
+  const [darkMode, setDarkMode] = useState(true);
+ 
+  const handleUpload = useCallback((img) => {
+    setImage(img); setPage("studio");
+  }, []);
+ 
+  if (page==="upload") return <UploadPage onUpload={handleUpload} darkMode={darkMode} />;
+  return <StudioPage image={image} onBack={()=>setPage("upload")} darkMode={darkMode} toggleDark={()=>setDarkMode(d=>!d)} />;
+}
